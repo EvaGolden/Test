@@ -968,4 +968,205 @@
     riderSharing = true;
     document.getElementById("riderShareBtn").textContent = "STOP SHARING";
     document.getElementById("riderShareBtn").style.background = "#ef4444";
-    document.getElementById("riderShareStatus").innerHTML = '<span class="rider-dot live"></span> Live
+    document.getElementById("riderShareStatus").innerHTML = '<span class="rider-dot live"></span> Live';
+    rtdb.ref('orders/' + riderCurrentOrderId).update({ riderStatus: "online", lastStatusUpdate: Date.now() });
+    riderWatchId = navigator.geolocation.watchPosition(
+      async (pos) => {
+        const lat = pos.coords.latitude, lng = pos.coords.longitude;
+        document.getElementById("riderCoords").innerText = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+        await rtdb.ref('orders/' + riderCurrentOrderId).update({
+          riderLocation: { latitude: lat, longitude: lng, timestamp: Date.now() },
+          riderStatus: "online",
+          lastStatusUpdate: Date.now()
+        });
+        const snap = await rtdb.ref('orders/' + riderCurrentOrderId).once('value');
+        if (snap.val().status === "rider_assigned") await rtdb.ref('orders/' + riderCurrentOrderId).update({ status: "on_the_way" });
+        showActiveDelivery();
+      },
+      (err) => {
+        console.warn("GPS error:", err);
+        rtdb.ref('orders/' + riderCurrentOrderId).update({ riderStatus: "offline", lastStatusUpdate: Date.now() });
+      },
+      { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 }
+    );
+    if (activeOrderListener) clearInterval(activeOrderListener);
+    activeOrderListener = setInterval(async () => {
+      if (riderCurrentOrderId && riderSharing) {
+        const snap = await rtdb.ref('orders/' + riderCurrentOrderId).once('value');
+        const last = snap.val().lastStatusUpdate || 0;
+        if (Date.now() - last > OFFLINE_TIMEOUT) {
+          await rtdb.ref('orders/' + riderCurrentOrderId).update({ riderStatus: "offline" });
+        }
+      }
+    }, 15000);
+  }
+
+  function riderStopSharing() {
+    if (riderWatchId) navigator.geolocation.clearWatch(riderWatchId);
+    if (activeOrderListener) clearInterval(activeOrderListener);
+    riderSharing = false;
+    document.getElementById("riderShareBtn").textContent = "START SHARING";
+    document.getElementById("riderShareBtn").style.background = "#22c55e";
+    document.getElementById("riderShareStatus").innerHTML = '<span class="rider-dot"></span> Idle';
+    if (riderCurrentOrderId) {
+      rtdb.ref('orders/' + riderCurrentOrderId).update({ riderStatus: "offline" });
+    }
+  }
+
+  window.markAsDelivered = async function() {
+    if (!riderCurrentOrderId) return;
+    if (!confirm("Mark this order as delivered?")) return;
+    if (riderSharing) riderStopSharing();
+    await rtdb.ref('orders/' + riderCurrentOrderId).update({
+      status: "delivered",
+      riderLocation: null,
+      riderStatus: null,
+      assigned: false
+    });
+    toast("Order marked as delivered!");
+    riderCurrentOrderId = null;
+    document.getElementById("activeDeliverySection").style.display = "none";
+    loadPendingOrders();
+  };
+
+  window.riderLogout = function() {
+    if (riderSharing) riderStopSharing();
+    if (pendingOrdersListener) pendingOrdersListener();
+    if (activeOrderListener) clearInterval(activeOrderListener);
+    riderCurrentOrderId = null;
+    document.getElementById("riderDashboard").style.display = "none";
+    document.getElementById("riderLoginPanel").style.display = "block";
+    document.getElementById("riderPin").value = "";
+    closeRiderModal();
+  };
+
+  window.closeRiderModal = function() { document.getElementById("riderModal").classList.remove("active"); if(riderSharing) riderStopSharing(); };
+  window.openRiderModal = function() { document.getElementById("riderModal").classList.add("active"); };
+
+  // ==================== UI MENU, CART, ORDER ====================
+  function goTo(p) {
+    document.querySelectorAll('.page').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.ni').forEach(x => x.classList.remove('active'));
+    document.getElementById('page-' + p).classList.add('active');
+    document.getElementById('nav-' + p).classList.add('active');
+    if (p === 'order') updPreview();
+    if (p === 'cart') renderCart();
+    if (p === 'track') setTrackMode('pickup');
+    window.scrollTo({top:0, behavior:'smooth'});
+  }
+
+  function buildMenu() {
+    const cats = actCat === "ALL" ? ["MAINS","PROTEINS","EXTRAS"] : [actCat];
+    const CL = {MAINS:"🍝 Mains", PROTEINS:"🍗 Proteins", EXTRAS:"🥗 Extras"};
+    let h = "";
+    for (const c of cats) {
+      const items = ITEMS.filter(i => i.cat === c);
+      if (!items.length) continue;
+      h += `<div class="sec-title">${CL[c]}</div><div class="menu-grid">`;
+      items.forEach(i => {
+        h += `<div class="menu-card">
+          <img class="menu-img" src="${i.img}" alt="${i.name}" loading="lazy" onerror="this.src='https://placehold.co/400x250/fef0e6/f2622e?text=🔥'">
+          <div class="menu-info">
+            <div class="menu-name">${i.name}</div>
+            <div class="menu-desc">${i.desc}</div>
+            <div class="menu-bottom">
+              <div class="menu-price">${fmt(i.price)}</div>
+              <button class="order-btn" onclick="addItem(${i.id})"><i class="fas fa-shopping-cart"></i> ORDER</button>
+            </div>
+          </div>
+        </div>`;
+      });
+      h += "</div>";
+    }
+    document.getElementById("menuContent").innerHTML = h;
+  }
+
+  document.querySelectorAll('.cat-pill').forEach(p => p.addEventListener('click', () => {
+    document.querySelectorAll('.cat-pill').forEach(x => x.classList.remove('active'));
+    p.classList.add('active'); actCat = p.dataset.cat; buildMenu();
+  }));
+
+  function addItem(id) { const it=ITEMS.find(i=>i.id===id); const ex=cart.find(i=>i.id===id); if(ex) ex.qty++; else cart.push({...it,qty:1}); updBadge(); toast("✅ "+it.name+" added to cart!"); }
+  window.updateQty = (id,d) => { const idx=cart.findIndex(i=>i.id===id); if(idx===-1) return; cart[idx].qty+=d; if(cart[idx].qty<=0) cart.splice(idx,1); updBadge(); renderCart(); updPreview(); };
+  function updBadge() { const n=cart.reduce((s,i)=>s+i.qty,0); document.getElementById("cartCount").textContent=n; const b=document.getElementById("navBadge"); b.style.display=n>0?"flex":"none"; b.textContent=n; }
+  function renderCart() {
+    const el=document.getElementById("cartContent"), sm=document.getElementById("cartSummary"), cw=document.getElementById("chkWrap");
+    if (!cart.length) { el.innerHTML=`<div class="cart-empty"><i class="fas fa-bag-shopping"></i><h3>CART IS EMPTY</h3><p>Go to Menu and tap ORDER to add items!</p></div>`; sm.style.display="none"; cw.innerHTML=""; return; }
+    el.innerHTML=`<div class="cart-list">${cart.map(it=>`<div class="cart-item"><img class="ci-img" src="${it.img}" onerror="this.src='https://placehold.co/100x100/fef0e6/f2622e?text=🔥'"><div class="ci-info"><div class="ci-name">${it.name}</div><div class="ci-unit">${fmt(it.price)} each</div><div class="qty-row"><button class="qty-btn" onclick="updateQty(${it.id},-1)">−</button><span class="qty-num">${it.qty}</span><button class="qty-btn" onclick="updateQty(${it.id},1)">+</button></div></div><div class="ci-price">${fmt(it.price*it.qty)}</div></div>`).join("")}</div>`;
+    const isD = OT === "Delivery";
+    document.getElementById("sSub").textContent = fmt(sub());
+    document.getElementById("dRow").style.display = isD ? "flex" : "none";
+    document.getElementById("sTotal").textContent = fmt(tot());
+    sm.style.display = "block";
+    cw.innerHTML = `<button class="wa-btn" onclick="goTo('order')"><i class="fas fa-receipt"></i> FILL ORDER DETAILS</button>`;
+  }
+
+  function genMsg() {
+    if (!cart.length) return "🔥 Patogrills: Cart is empty.";
+    const lines = cart.map(i => `• ${i.qty} x ${i.name} — ${fmt(i.qty * i.price)}`).join("\n");
+    const nm = document.getElementById("name").value.trim() || "—";
+    const ph = document.getElementById("phone").value.trim() || "—";
+    const ad = OT === "Delivery" ? (document.getElementById("address").value.trim() || "—") : null;
+    const nt = document.getElementById("notes").value.trim() || "—";
+    const dl = OT === "Delivery" ? `\n🚚 Delivery fee: ${fmt(FEE)}` : "";
+    return `🍢 *PATO GRILLS ORDER* 🍢\n\n🔖 *Order ID:* ${ORDER_ID}\n\n${lines}${dl}\n\n────────────────\n📦 *Total:* ${fmt(tot())}\n\n📌 *Order type:* ${OT}\n👤 *Name:* ${nm}\n📞 *Phone:* ${ph}${ad !== null ? `\n📍 *Address:* ${ad}` : ""}\n📝 *Notes:* ${nt}\n\n🔥 *Enjoy the Thrills Of The Grills — Good Food No Dey Rush*`;
+  }
+
+  function updPreview() {
+    document.getElementById("preview").textContent = genMsg();
+    const lk = document.getElementById("sendLink");
+    if (!cart.length) { lk.href = "#"; return; }
+    lk.href = `https://wa.me/${PH}?text=${encodeURIComponent(genMsg())}`;
+  }
+
+  document.getElementById("sendLink").addEventListener("click", async (e) => {
+    if (!cart.length) { e.preventDefault(); toast("🍽️ Add items first!"); return; }
+    if (OT === "Delivery" && !document.getElementById("address").value.trim()) { e.preventDefault(); toast("📍 Please enter your delivery address first"); return; }
+    const saved = await saveOrderToRTDB();
+    if (!saved) e.preventDefault();
+  });
+
+  ["name","phone","address","notes"].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener("input", updPreview); });
+
+  const pickupPanel = document.getElementById("pickupPanel"), deliveryPanel = document.getElementById("deliveryPanel");
+  const togglePickup = document.getElementById("togglePickupBtn"), toggleDelivery = document.getElementById("toggleDeliveryTrackBtn");
+  function setTrackMode(mode) {
+    if(mode === 'pickup') { pickupPanel.classList.remove("hidden-panel"); deliveryPanel.classList.add("hidden-panel"); togglePickup.classList.add("active-toggle"); toggleDelivery.classList.remove("active-toggle"); }
+    else { pickupPanel.classList.add("hidden-panel"); deliveryPanel.classList.remove("hidden-panel"); toggleDelivery.classList.add("active-toggle"); togglePickup.classList.remove("active-toggle"); }
+  }
+  togglePickup.addEventListener("click", () => setTrackMode('pickup'));
+  toggleDelivery.addEventListener("click", () => setTrackMode('delivery'));
+
+  // ==================== ONBOARDING CONTROL ====================
+  let obI = 0;
+  function showOBStep(i) {
+    for(let j=0;j<4;j++){ document.getElementById("os"+j).classList.toggle("on",j===i); document.getElementById("d"+j).classList.toggle("on",j===i); }
+    document.getElementById("obNext").innerText = i===3?"LET'S EAT! 🔥":"NEXT →";
+  }
+  document.getElementById("obNext").onclick = () => { if(obI<3){ obI++; showOBStep(obI); } else closeOB(); };
+  document.getElementById("obSkip").onclick = closeOB;
+  function closeOB() { localStorage.setItem("pg_ob2","1"); const el=document.getElementById("onboarding"); el.classList.add("fade-out"); setTimeout(()=>el.classList.add("gone"),380); }
+  function initOB() { if(localStorage.getItem("pg_ob2")){ document.getElementById("onboarding").classList.add("gone"); return; } showOBStep(0); }
+
+  // ==================== RIDER MODAL INIT ====================
+  document.getElementById("riderModal").innerHTML = `
+    <div class="rider-modal-content"><div class="rider-close" onclick="closeRiderModal()">&times;</div>
+    <div class="rider-inner"><div id="riderLoginPanel"><div class="rider-logo">PATO<span>GRILLS</span></div>
+    <div class="rider-field-label">Rider PIN</div><input type="password" id="riderPin" class="rider-input" placeholder="••••••">
+    <div id="riderError" class="rider-error">Invalid PIN (use pato2026)</div>
+    <button class="rider-btn" onclick="riderLogin()">ENTER PANEL</button></div>
+    <div id="riderDashboard" style="display:none;"><div class="rider-logo">DELIVERY <span>DASHBOARD</span></div>
+    <div id="pendingOrdersSection"><div class="rider-field-label">📋 Pending Orders</div><div id="pendingOrdersList" style="margin-bottom:20px;">Loading...</div></div>
+    <div id="activeDeliverySection" style="display:none;"><div class="rider-field-label">🚚 Your Active Delivery</div><div id="activeDeliveryCard" class="active-delivery-card"></div>
+    <div><button class="navigate-btn" id="navigateBtn" onclick="navigateToAddress()"><i class="fas fa-directions"></i> Navigate</button>
+    <button id="riderShareBtn" class="rider-btn" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;" onclick="riderToggleSharing()">START SHARING</button>
+    <button id="markDeliveredBtn" class="rider-btn" style="background:#ef4444; display:inline-block; width:auto; padding:8px 16px;" onclick="markAsDelivered()">Delivered</button></div>
+    <div class="rider-status-block"><div class="rider-row"><span>Location Sharing</span><span id="riderShareStatus" class="rider-live-badge"><span class="rider-dot" id="riderDot"></span> Idle</span></div>
+    <div id="riderCoords" style="font-size:11px; color:#888;">Waiting for GPS</div></div></div>
+    <button class="rider-btn" style="background:#ef4444; margin-top:20px;" onclick="riderLogout()">LOGOUT</button></div></div></div>`;
+
+  // ==================== INITIALIZE EVERYTHING ====================
+  buildMenu(); renderCart(); initOB(); selOT("Delivery"); updateOrderBannerVisibility(); setTrackMode('pickup');
+</script>
+</body>
+</html>
