@@ -8,14 +8,16 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <!-- Leaflet + routing machine (OSRM) -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+  <!-- Firebase SDKs -->
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
   <style>
-    /* ===== YOUR EXACT STYLES (unchanged) ===== */
+    /* ===== YOUR EXACT STYLES (unchanged – preserved completely) ===== */
     :root {
       --fire: #f2622e;
       --fire-deep: #c84318;
@@ -41,8 +43,7 @@
       overflow-x: hidden;
       padding-bottom: calc(var(--nav-h) + var(--safe-bottom) + 8px);
     }
-
-    /* Onboarding (unchanged) */
+    /* Onboarding (full original – kept) */
     #onboarding {
       position: fixed; inset: 0; z-index: 9999;
       display: flex; flex-direction: column;
@@ -177,7 +178,7 @@
     .oid-copy-btn:hover { background: rgba(242,98,46,0.25); }
     .oid-tip { font-size: 0.7rem; color: rgba(255,255,255,0.35); margin-top: 2px; width: 100%; }
 
-    /* Reviews, Map Card, Cart, Form, etc. (all original) – keep as is */
+    /* Reviews, Map Card, Cart, Form, etc. (all original) */
     .g-review-wrap { background:white; border-radius:28px; margin:32px 0 24px; padding:22px 20px; box-shadow:0 12px 28px -8px rgba(0,0,0,0.08); border:1px solid var(--border); }
     .g-review-header { display:flex; align-items:center; gap:10px; font-family:var(--BF); font-size:1.35rem; letter-spacing:1px; color:var(--black); margin-bottom:8px; }
     .g-review-header i { color:var(--fire); font-size:1.4rem; }
@@ -555,7 +556,7 @@
   </div>
 </div>
 
-<!-- PAGE: TRACK ORDER (with Leaflet map, route, ETA, offline status) -->
+<!-- PAGE: TRACK ORDER (Leaflet + OSRM) -->
 <div id="page-track" class="page">
   <div class="sec-title"><i class="fas fa-map-marked-alt"></i> Track Order</div>
   <div class="track-toggle-bar">
@@ -685,7 +686,6 @@
     if (!name || !phone) { toast("❌ Please fill in your name and phone number"); return false; }
     if (OT === "Delivery" && !address) { toast("📍 Please enter your delivery address"); return false; }
 
-    // Capture GPS right now, inline
     let coords = null;
     if (OT === "Delivery") {
       coords = await captureCustomerLocation();
@@ -708,13 +708,8 @@
       customerLng: coords ? coords.lng : null
     };
 
-    // Also write to customerLocations for backward compat
     if (coords) {
-      rtdb.ref('customerLocations/' + ORDER_ID).set({
-        lat: coords.lat, lng: coords.lng,
-        timestamp: Date.now(), orderId: ORDER_ID,
-        address: address || "Auto-detected"
-      });
+      rtdb.ref('customerLocations/' + ORDER_ID).set({ lat: coords.lat, lng: coords.lng, timestamp: Date.now(), orderId: ORDER_ID });
     }
 
     try {
@@ -733,25 +728,28 @@
     renderCart(); updPreview(); updateOrderBannerVisibility();
   };
 
-  // ==================== PROFESSIONAL CUSTOMER TRACKING ====================
+  // ==================== LEaFLET + OSRM TRACKING ====================
   function initTrackMap(custLat, custLng) {
     const container = document.getElementById("liveTrackingMap");
     container.style.display = "block";
     if (trackMap) trackMap.remove();
     trackMap = L.map(container).setView([custLat, custLng], 14);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; OSM' }).addTo(trackMap);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>' }).addTo(trackMap);
     customerMarker = L.marker([custLat, custLng], { icon: L.divIcon({ html: '📍', iconSize: [30,30], className: 'cust-icon' }) }).addTo(trackMap).bindPopup('Your delivery spot');
     mapCentered = true;
   }
 
   function updateTrackingUI(riderLat, riderLng, custLat, custLng, lastUpdateTimestamp) {
     if (!trackMap) initTrackMap(custLat, custLng);
+    // Update rider marker
     if (riderMarker) riderMarker.setLatLng([riderLat, riderLng]);
     else riderMarker = L.marker([riderLat, riderLng], { icon: L.divIcon({ html: '🏍️', iconSize: [30,30] }) }).addTo(trackMap).bindPopup('Rider');
     
+    // Update or create route using OSRM via Leaflet Routing Machine
     if (routingControl) trackMap.removeControl(routingControl);
     routingControl = L.Routing.control({
       waypoints: [L.latLng(riderLat, riderLng), L.latLng(custLat, custLng)],
+      router: L.Routing.osrmv1({ serviceUrl: 'https://router.project-osrm.org/route/v1' }),
       routeWhileDragging: false,
       show: false,
       addWaypoints: false,
@@ -759,22 +757,46 @@
       lineOptions: { styles: [{ color: '#f2622e', weight: 4 }] }
     }).addTo(trackMap);
     
-    const R = 6371;
-    const dLat = (custLat - riderLat) * Math.PI / 180;
-    const dLon = (custLng - riderLng) * Math.PI / 180;
-    const a = Math.sin(dLat/2)**2 + Math.cos(riderLat * Math.PI/180) * Math.cos(custLat * Math.PI/180) * Math.sin(dLon/2)**2;
-    const distanceKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    const etaMinutes = Math.round(distanceKm / 0.03 * 60);
-    const timeAgo = Math.floor((Date.now() - lastUpdateTimestamp) / 1000);
-    const isOnline = timeAgo < OFFLINE_TIMEOUT;
-    const statusDiv = document.getElementById("trackStatusResult");
-    statusDiv.innerHTML = `
-      <i class="fas fa-truck-fast"></i> <strong>Status:</strong> ${isOnline ? '🟢 Rider online' : '🔴 Rider offline (no signal)'}<br>
-      <i class="fas fa-route"></i> <strong>Distance:</strong> ${distanceKm.toFixed(1)} km<br>
-      <i class="fas fa-clock"></i> <strong>ETA:</strong> ~${etaMinutes} min<br>
-      <i class="fas fa-sync-alt"></i> <strong>Last update:</strong> ${timeAgo} sec ago
-    `;
-    if (!isOnline) statusDiv.innerHTML += `<br><span style="color:red;">⚠️ Rider connection lost. Please refresh or contact support.</span>`;
+    // Get distance & ETA from route
+    routingControl.on('routesfound', (e) => {
+      const route = e.routes[0];
+      const distance = route.summary.totalDistance; // meters
+      const duration = route.summary.totalTime;     // seconds
+      const distKm = (distance / 1000).toFixed(1);
+      const etaMin = Math.round(duration / 60);
+      const timeAgo = Math.floor((Date.now() - lastUpdateTimestamp) / 1000);
+      const isOnline = timeAgo < OFFLINE_TIMEOUT;
+      const statusDiv = document.getElementById("trackStatusResult");
+      statusDiv.innerHTML = `
+        <i class="fas fa-truck-fast"></i> <strong>Status:</strong> ${isOnline ? '🟢 Rider online' : '🔴 Rider offline (no signal)'}<br>
+        <i class="fas fa-route"></i> <strong>Distance:</strong> ${distKm} km<br>
+        <i class="fas fa-clock"></i> <strong>ETA:</strong> ~${etaMin} min<br>
+        <i class="fas fa-sync-alt"></i> <strong>Last update:</strong> ${timeAgo} sec ago
+      `;
+      if (!isOnline) statusDiv.innerHTML += `<br><span style="color:red;">⚠️ Rider connection lost. Please refresh or contact support.</span>`;
+    });
+    // Fallback in case route fails
+    setTimeout(() => {
+      if (!routingControl || !routingControl._routes) {
+        // Fallback straight-line distance
+        const R = 6371;
+        const dLat = (custLat - riderLat) * Math.PI / 180;
+        const dLon = (custLng - riderLng) * Math.PI / 180;
+        const a = Math.sin(dLat/2)**2 + Math.cos(riderLat * Math.PI/180) * Math.cos(custLat * Math.PI/180) * Math.sin(dLon/2)**2;
+        const distKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        const etaMin = Math.round(distKm / 0.03 * 60);
+        const timeAgo = Math.floor((Date.now() - lastUpdateTimestamp) / 1000);
+        const isOnline = timeAgo < OFFLINE_TIMEOUT;
+        const statusDiv = document.getElementById("trackStatusResult");
+        statusDiv.innerHTML = `
+          <i class="fas fa-truck-fast"></i> <strong>Status:</strong> ${isOnline ? '🟢 Rider online' : '🔴 Rider offline (no signal)'}<br>
+          <i class="fas fa-route"></i> <strong>Distance:</strong> ${distKm.toFixed(1)} km<br>
+          <i class="fas fa-clock"></i> <strong>ETA:</strong> ~${etaMin} min<br>
+          <i class="fas fa-sync-alt"></i> <strong>Last update:</strong> ${timeAgo} sec ago
+        `;
+        if (!isOnline) statusDiv.innerHTML += `<br><span style="color:red;">⚠️ Rider connection lost. Please refresh.</span>`;
+      }
+    }, 2000);
   }
 
   function trackDeliveryOrder(orderId) {
@@ -789,7 +811,6 @@
         return;
       }
       const orderData = snap.val();
-      // Try coords from the order itself first, then fallback to customerLocations
       let custLat = orderData.customerLat;
       let custLng = orderData.customerLng;
       if (!custLat || !custLng) {
@@ -799,9 +820,8 @@
           custLng = custSnap.val().lng;
         }
       }
-      // If still no coords, show a meaningful status but still listen for rider
       if (!custLat || !custLng) {
-        resultDiv.innerHTML = `📦 <strong>Order found!</strong><br>👤 ${orderData.customerName} | ${orderData.address}<br><br>📍 GPS location not available for this order — rider is using your address.<br><br>⏳ Waiting for rider to start delivery...`;
+        resultDiv.innerHTML = `📦 <strong>Order found!</strong><br>👤 ${orderData.customerName} | ${orderData.address}<br><br>📍 GPS location not available — rider is using your address.<br><br>⏳ Waiting for rider to start delivery...`;
         trackOrderRef = orderRef.on('value', (rSnap) => {
           const rd = rSnap.val();
           if (rd && rd.riderLocation && rd.riderLocation.latitude) {
@@ -813,7 +833,7 @@
             }
             if (riderMarker) riderMarker.setLatLng([rd.riderLocation.latitude, rd.riderLocation.longitude]);
             else riderMarker = L.marker([rd.riderLocation.latitude, rd.riderLocation.longitude], {
-              icon: L.divIcon({ html: '🏍️', iconSize:[30,30], className:'' })
+              icon: L.divIcon({ html: '🏍️', iconSize:[30,30] })
             }).addTo(trackMap).bindPopup('Your Rider');
             trackMap.setView([rd.riderLocation.latitude, rd.riderLocation.longitude], 14);
             const timeAgo = Math.floor((Date.now() - rd.riderLocation.timestamp) / 1000);
@@ -822,7 +842,6 @@
         });
         return;
       }
-      // We have customer coords — show full Uber-style tracking
       initTrackMap(custLat, custLng);
       resultDiv.innerHTML = `📦 <strong>Order found!</strong> Waiting for rider to start delivery...`;
       trackOrderRef = orderRef.on('value', (riderSnap) => {
