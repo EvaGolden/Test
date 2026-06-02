@@ -464,6 +464,7 @@
     #liveTrackingMap { height: 280px; border-radius: 20px; margin-top: 12px; background: #e9e5e0; z-index: 1; width: 100%; }
     .track-info-panel { background: rgba(0,0,0,0.7); border-radius: 16px; padding: 12px; margin-top: 12px; color: white; font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
     .track-info-panel span { display: flex; align-items: center; gap: 6px; }
+    .error-msg { background: #fee2e2; border-left: 4px solid #ef4444; padding: 12px; border-radius: 16px; margin: 12px 0; font-size: 0.85rem; color: #b91c1c; }
   </style>
 </head>
 <body>
@@ -527,7 +528,7 @@
   <div style="margin-top:14px;" id="chkWrap"></div>
 </div>
 
-<!-- PAGE: ORDER (with automatic geolocation capture) -->
+<!-- PAGE: ORDER (with automatic geolocation capture + location permission enforcement) -->
 <div id="page-order" class="page">
   <div class="sec-title"><i class="fas fa-receipt"></i> Your Details</div>
   <div id="orderIdBanner" class="order-id-banner">
@@ -547,7 +548,7 @@
     </div>
     <div id="addrWrap" class="iw"><label>Delivery Address</label><textarea id="address" rows="2" placeholder="Street, landmark..."></textarea></div>
     <div class="iw"><label>Special Notes</label><textarea id="notes" rows="2" placeholder="Extra spice, no onion..."></textarea></div>
-    <div id="locationStatus" style="font-size:0.7rem; color:var(--text-muted); margin-top:6px; text-align:center;"></div>
+    <div id="locationStatus" style="font-size:0.75rem; margin-top:6px; text-align:center; color:var(--text-muted);"></div>
   </div>
   <div class="form-sec">
     <h3><i class="fab fa-whatsapp"></i> Order Preview</h3>
@@ -556,7 +557,7 @@
   </div>
 </div>
 
-<!-- PAGE: TRACK ORDER (Leaflet + OSRM) -->
+<!-- PAGE: TRACK ORDER (Leaflet + OSRM - FIXED: shows both markers, route, distance, ETA) -->
 <div id="page-track" class="page">
   <div class="sec-title"><i class="fas fa-map-marked-alt"></i> Track Order</div>
   <div class="track-toggle-bar">
@@ -606,7 +607,7 @@
 <div id="riderModal" class="rider-modal"></div>
 
 <script>
-  // ==================== FIREBASE CONFIG ====================
+  // ==================== FIREBASE CONFIG (ORIGINAL) ====================
   const firebaseConfig = {
     apiKey: "AIzaSyDNZUtiUoEuV6cqF90144wqwsGAFERnsuw",
     authDomain: "tracking-61ea4.firebaseapp.com",
@@ -638,8 +639,8 @@
   let trackMap = null, riderMarker = null, customerMarker = null, routingControl = null, trackOrderRef = null;
   let mapCentered = false;
   const OFFLINE_TIMEOUT = 60000;
+  let locationPermissionDenied = false; // flag to block order
 
-  // Helper functions
   function generateOrderId() {
     const now = new Date();
     const dateStr = now.getFullYear() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
@@ -655,29 +656,34 @@
   const tot = () => sub() + (OT === "Delivery" && cart.length ? FEE : 0);
   function updateOrderBannerVisibility() { document.getElementById('orderIdBanner').style.display = OT === 'Delivery' ? 'flex' : 'none'; }
 
-  // ==================== CUSTOMER LOCATION CAPTURE (called just before save) ====================
-  let customerLocationCaptured = false;
+  // ==================== CAPTURE CUSTOMER LOCATION (RETURNS COORDS OR THROWS ERROR) ====================
   function captureCustomerLocation() {
-    return new Promise((resolve) => {
-      if (!navigator.geolocation) { resolve(null); return; }
-      document.getElementById("locationStatus").innerHTML = `<i class="fas fa-spinner fa-spin"></i> Getting your exact location…`;
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error("Geolocation not supported by your browser."));
+        return;
+      }
+      document.getElementById("locationStatus").innerHTML = `<i class="fas fa-spinner fa-spin"></i> Getting your exact location... Please allow GPS.`;
       navigator.geolocation.getCurrentPosition(
         (pos) => {
-          customerLocationCaptured = true;
-          document.getElementById("locationStatus").innerHTML = `✅ Exact location captured! Rider will navigate to you.`;
+          document.getElementById("locationStatus").innerHTML = `✅ Location captured! Rider will navigate to you.`;
           resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude });
         },
-        () => {
-          document.getElementById("locationStatus").innerHTML = `⚠️ Could not get GPS. Using address instead.`;
-          resolve(null);
+        (err) => {
+          let msg = "";
+          if (err.code === err.PERMISSION_DENIED) msg = "Location permission denied. Please enable GPS in your browser to place a delivery order.";
+          else if (err.code === err.POSITION_UNAVAILABLE) msg = "Location unavailable. Check GPS signal.";
+          else msg = "Could not get location. Please check your settings.";
+          document.getElementById("locationStatus").innerHTML = `⚠️ ${msg}`;
+          reject(new Error(msg));
         },
-        { enableHighAccuracy: true, timeout: 8000 }
+        { enableHighAccuracy: true, timeout: 10000 }
       );
     });
   }
 
-  // ==================== SAVE ORDER TO REALTIME DB ====================
-  async function saveOrderToRTDB() {
+  // ==================== SAVE ORDER TO REALTIME DB (stores customerLocation NESTED OBJECT) ====================
+  async function saveOrderToRTDB(customerCoords) {
     if (!cart.length) return false;
     const name = document.getElementById("name").value.trim();
     const phone = document.getElementById("phone").value.trim();
@@ -685,11 +691,6 @@
     const notes = document.getElementById("notes").value.trim();
     if (!name || !phone) { toast("❌ Please fill in your name and phone number"); return false; }
     if (OT === "Delivery" && !address) { toast("📍 Please enter your delivery address"); return false; }
-
-    let coords = null;
-    if (OT === "Delivery") {
-      coords = await captureCustomerLocation();
-    }
 
     const orderData = {
       orderId: ORDER_ID,
@@ -704,13 +705,9 @@
       timestamp: Date.now(),
       assigned: false,
       riderLocation: null,
-      customerLat: coords ? coords.lat : null,
-      customerLng: coords ? coords.lng : null
+      // Store customer location as nested object for easy access
+      customerLocation: customerCoords ? { latitude: customerCoords.lat, longitude: customerCoords.lng, timestamp: Date.now() } : null
     };
-
-    if (coords) {
-      rtdb.ref('customerLocations/' + ORDER_ID).set({ lat: coords.lat, lng: coords.lng, timestamp: Date.now(), orderId: ORDER_ID });
-    }
 
     try {
       await rtdb.ref('orders/' + ORDER_ID).set(orderData);
@@ -719,33 +716,42 @@
     } catch (err) { console.error(err); toast("⚠️ Could not save order"); return false; }
   }
 
-  // ==================== ORDER TYPE SELECT (no premature GPS) ====================
+  // ==================== ORDER TYPE SELECT ====================
   window.selOT = type => {
     OT = type;
     document.getElementById("od").classList.toggle("sel", type === "Delivery");
     document.getElementById("op").classList.toggle("sel", type === "Pickup");
     document.getElementById("addrWrap").classList.toggle("hf", type !== "Delivery");
     renderCart(); updPreview(); updateOrderBannerVisibility();
+    // Clear location status message when toggling
+    document.getElementById("locationStatus").innerHTML = "";
   };
 
-  // ==================== LEaFLET + OSRM TRACKING ====================
+  // ==================== TRACKING MAP (CUSTOMER + RIDER + ROUTE) ====================
   function initTrackMap(custLat, custLng) {
     const container = document.getElementById("liveTrackingMap");
     container.style.display = "block";
     if (trackMap) trackMap.remove();
     trackMap = L.map(container).setView([custLat, custLng], 14);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>' }).addTo(trackMap);
-    customerMarker = L.marker([custLat, custLng], { icon: L.divIcon({ html: '📍', iconSize: [30,30], className: 'cust-icon' }) }).addTo(trackMap).bindPopup('Your delivery spot');
+    // Customer marker (📍)
+    customerMarker = L.marker([custLat, custLng], { 
+      icon: L.divIcon({ html: '📍', iconSize: [30,30], className: 'cust-icon' }) 
+    }).addTo(trackMap).bindPopup('Your delivery location');
     mapCentered = true;
   }
 
   function updateTrackingUI(riderLat, riderLng, custLat, custLng, lastUpdateTimestamp) {
     if (!trackMap) initTrackMap(custLat, custLng);
-    // Update rider marker
+    // Update or create rider marker
     if (riderMarker) riderMarker.setLatLng([riderLat, riderLng]);
-    else riderMarker = L.marker([riderLat, riderLng], { icon: L.divIcon({ html: '🏍️', iconSize: [30,30] }) }).addTo(trackMap).bindPopup('Rider');
+    else {
+      riderMarker = L.marker([riderLat, riderLng], { 
+        icon: L.divIcon({ html: '🏍️', iconSize: [30,30] }) 
+      }).addTo(trackMap).bindPopup('Rider');
+    }
     
-    // Update or create route using OSRM via Leaflet Routing Machine
+    // Update or create route (OSRM)
     if (routingControl) trackMap.removeControl(routingControl);
     routingControl = L.Routing.control({
       waypoints: [L.latLng(riderLat, riderLng), L.latLng(custLat, custLng)],
@@ -757,16 +763,17 @@
       lineOptions: { styles: [{ color: '#f2622e', weight: 4 }] }
     }).addTo(trackMap);
     
-    // Get distance & ETA from route
+    // Calculate distance & ETA when route is found
     routingControl.on('routesfound', (e) => {
       const route = e.routes[0];
-      const distance = route.summary.totalDistance; // meters
-      const duration = route.summary.totalTime;     // seconds
-      const distKm = (distance / 1000).toFixed(1);
-      const etaMin = Math.round(duration / 60);
+      const distanceMeters = route.summary.totalDistance;
+      const durationSec = route.summary.totalTime;
+      const distKm = (distanceMeters / 1000).toFixed(1);
+      const etaMin = Math.round(durationSec / 60);
       const timeAgo = Math.floor((Date.now() - lastUpdateTimestamp) / 1000);
       const isOnline = timeAgo < OFFLINE_TIMEOUT;
       const statusDiv = document.getElementById("trackStatusResult");
+      statusDiv.style.display = "block";
       statusDiv.innerHTML = `
         <i class="fas fa-truck-fast"></i> <strong>Status:</strong> ${isOnline ? '🟢 Rider online' : '🔴 Rider offline (no signal)'}<br>
         <i class="fas fa-route"></i> <strong>Distance:</strong> ${distKm} km<br>
@@ -775,23 +782,23 @@
       `;
       if (!isOnline) statusDiv.innerHTML += `<br><span style="color:red;">⚠️ Rider connection lost. Please refresh or contact support.</span>`;
     });
-    // Fallback in case route fails
+    // Fallback if route fails after 2 seconds (straight line approx)
     setTimeout(() => {
-      if (!routingControl || !routingControl._routes) {
-        // Fallback straight-line distance
+      if (!routingControl || !routingControl._routes || routingControl._routes.length === 0) {
         const R = 6371;
         const dLat = (custLat - riderLat) * Math.PI / 180;
         const dLon = (custLng - riderLng) * Math.PI / 180;
         const a = Math.sin(dLat/2)**2 + Math.cos(riderLat * Math.PI/180) * Math.cos(custLat * Math.PI/180) * Math.sin(dLon/2)**2;
         const distKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        const etaMin = Math.round(distKm / 0.03 * 60);
+        const etaMin = Math.round(distKm / 0.03 * 60); // assume avg speed 30 km/h
         const timeAgo = Math.floor((Date.now() - lastUpdateTimestamp) / 1000);
         const isOnline = timeAgo < OFFLINE_TIMEOUT;
         const statusDiv = document.getElementById("trackStatusResult");
+        statusDiv.style.display = "block";
         statusDiv.innerHTML = `
           <i class="fas fa-truck-fast"></i> <strong>Status:</strong> ${isOnline ? '🟢 Rider online' : '🔴 Rider offline (no signal)'}<br>
-          <i class="fas fa-route"></i> <strong>Distance:</strong> ${distKm.toFixed(1)} km<br>
-          <i class="fas fa-clock"></i> <strong>ETA:</strong> ~${etaMin} min<br>
+          <i class="fas fa-route"></i> <strong>Distance (approx):</strong> ${distKm.toFixed(1)} km<br>
+          <i class="fas fa-clock"></i> <strong>ETA (approx):</strong> ~${etaMin} min<br>
           <i class="fas fa-sync-alt"></i> <strong>Last update:</strong> ${timeAgo} sec ago
         `;
         if (!isOnline) statusDiv.innerHTML += `<br><span style="color:red;">⚠️ Rider connection lost. Please refresh.</span>`;
@@ -811,39 +818,18 @@
         return;
       }
       const orderData = snap.val();
-      let custLat = orderData.customerLat;
-      let custLng = orderData.customerLng;
+      // Read customerLocation from order record
+      const custLoc = orderData.customerLocation;
+      let custLat = custLoc?.latitude;
+      let custLng = custLoc?.longitude;
       if (!custLat || !custLng) {
-        const custSnap = await rtdb.ref('customerLocations/' + orderId).once('value');
-        if (custSnap.exists()) {
-          custLat = custSnap.val().lat;
-          custLng = custSnap.val().lng;
-        }
-      }
-      if (!custLat || !custLng) {
-        resultDiv.innerHTML = `📦 <strong>Order found!</strong><br>👤 ${orderData.customerName} | ${orderData.address}<br><br>📍 GPS location not available — rider is using your address.<br><br>⏳ Waiting for rider to start delivery...`;
-        trackOrderRef = orderRef.on('value', (rSnap) => {
-          const rd = rSnap.val();
-          if (rd && rd.riderLocation && rd.riderLocation.latitude) {
-            if (!trackMap) {
-              const container = document.getElementById("liveTrackingMap");
-              container.style.display = "block";
-              trackMap = L.map(container).setView([rd.riderLocation.latitude, rd.riderLocation.longitude], 14);
-              L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; OSM' }).addTo(trackMap);
-            }
-            if (riderMarker) riderMarker.setLatLng([rd.riderLocation.latitude, rd.riderLocation.longitude]);
-            else riderMarker = L.marker([rd.riderLocation.latitude, rd.riderLocation.longitude], {
-              icon: L.divIcon({ html: '🏍️', iconSize:[30,30] })
-            }).addTo(trackMap).bindPopup('Your Rider');
-            trackMap.setView([rd.riderLocation.latitude, rd.riderLocation.longitude], 14);
-            const timeAgo = Math.floor((Date.now() - rd.riderLocation.timestamp) / 1000);
-            resultDiv.innerHTML = `🟢 <strong>Rider is on the way!</strong><br>📍 Rider using address: <em>${rd.address}</em><br>🔄 Last update: ${timeAgo}s ago`;
-          }
-        });
+        resultDiv.innerHTML = `⚠️ Delivery order found but no GPS location available. Please ensure you allowed location when placing the order.`;
         return;
       }
+      // Initialize map with customer location
       initTrackMap(custLat, custLng);
-      resultDiv.innerHTML = `📦 <strong>Order found!</strong> Waiting for rider to start delivery...`;
+      resultDiv.innerHTML = `📦 <strong>Order found!</strong> Waiting for rider to start delivery...<br>📍 Your location is set.`;
+      // Listen for rider location updates
       trackOrderRef = orderRef.on('value', (riderSnap) => {
         const riderData = riderSnap.val();
         if (riderData && riderData.riderLocation && riderData.riderLocation.latitude) {
@@ -876,9 +862,8 @@
     trackDeliveryOrder(inputId);
   });
 
-  // ==================== SINGLE RIDER WORKFLOW (no random IDs) ====================
+  // ==================== RIDER WORKFLOW (unchanged but works with new structure) ====================
   const RIDER_PIN = "pato2026";
-
   async function riderLogin() {
     const pin = document.getElementById("riderPin").value;
     if (pin !== RIDER_PIN) { document.getElementById("riderError").style.display = "block"; return; }
@@ -888,7 +873,6 @@
     await loadPendingOrders();
     await resumeActiveDelivery();
   }
-
   async function loadPendingOrders() {
     if (pendingOrdersListener) pendingOrdersListener();
     const container = document.getElementById("pendingOrdersList");
@@ -910,18 +894,15 @@
       container.innerHTML = html || "<div style='color:#888;'>No pending orders</div>";
     });
   }
-
   window.acceptOrder = async function(orderId) {
     const activeCheck = await rtdb.ref('orders').orderByChild('assigned').equalTo(true).once('value');
     let alreadyActive = false;
     activeCheck.forEach(snap => { if (snap.val().status !== "delivered") alreadyActive = true; });
     if (alreadyActive) { toast("❌ You already have an active delivery. Complete it first."); return; }
-
     const orderRef = rtdb.ref('orders/' + orderId);
     const snap = await orderRef.once('value');
     const order = snap.val();
     if (!order || order.status !== "pending" || order.assigned) { toast("❌ Order no longer available."); return; }
-
     await orderRef.update({ assigned: true, status: "rider_assigned", assignedAt: Date.now() });
     riderCurrentOrderId = orderId;
     toast(`✅ Order ${order.orderId} accepted! GPS sharing started automatically.`);
@@ -929,7 +910,6 @@
     loadPendingOrders();
     setTimeout(() => { if (!riderSharing && riderCurrentOrderId) riderStartSharing(); }, 500);
   };
-
   async function resumeActiveDelivery() {
     const snapshot = await rtdb.ref('orders').orderByChild('assigned').equalTo(true).once('value');
     let activeOrder = null;
@@ -950,7 +930,6 @@
       document.getElementById("activeDeliverySection").style.display = "none";
     }
   }
-
   async function showActiveDelivery() {
     if (!riderCurrentOrderId) return;
     const snap = await rtdb.ref('orders/' + riderCurrentOrderId).once('value');
@@ -972,7 +951,6 @@
       document.getElementById("riderCoords").innerText = `${order.riderLocation.latitude.toFixed(5)}, ${order.riderLocation.longitude.toFixed(5)}`;
     }
   }
-
   window.navigateToAddress = async function() {
     if (!riderCurrentOrderId) return;
     const snap = await rtdb.ref('orders/' + riderCurrentOrderId).once('value');
@@ -980,7 +958,6 @@
     if (order && order.address) window.open(`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(order.address)}`, '_blank');
     else toast("No address found");
   };
-
   function riderStartSharing() {
     if (!riderCurrentOrderId) { toast("No active order"); return; }
     if (!navigator.geolocation) { alert("GPS not supported"); return; }
@@ -1019,7 +996,6 @@
       }
     }, 15000);
   }
-
   function riderStopSharing() {
     if (riderWatchId) navigator.geolocation.clearWatch(riderWatchId);
     if (activeOrderListener) clearInterval(activeOrderListener);
@@ -1031,7 +1007,6 @@
       rtdb.ref('orders/' + riderCurrentOrderId).update({ riderStatus: "offline" });
     }
   }
-
   window.markAsDelivered = async function() {
     if (!riderCurrentOrderId) return;
     if (!confirm("Mark this order as delivered?")) return;
@@ -1047,7 +1022,6 @@
     document.getElementById("activeDeliverySection").style.display = "none";
     loadPendingOrders();
   };
-
   window.riderLogout = function() {
     if (riderSharing) riderStopSharing();
     if (pendingOrdersListener) pendingOrdersListener();
@@ -1058,11 +1032,26 @@
     document.getElementById("riderPin").value = "";
     closeRiderModal();
   };
-
   window.closeRiderModal = function() { document.getElementById("riderModal").classList.remove("active"); if(riderSharing) riderStopSharing(); };
   window.openRiderModal = function() { document.getElementById("riderModal").classList.add("active"); };
+  // Rider modal HTML
+  document.getElementById("riderModal").innerHTML = `
+    <div class="rider-modal-content"><div class="rider-close" onclick="closeRiderModal()">&times;</div>
+    <div class="rider-inner"><div id="riderLoginPanel"><div class="rider-logo">PATO<span>GRILLS</span></div>
+    <div class="rider-field-label">Rider PIN</div><input type="password" id="riderPin" class="rider-input" placeholder="••••••">
+    <div id="riderError" class="rider-error">Invalid PIN (use pato2026)</div>
+    <button class="rider-btn" onclick="riderLogin()">ENTER PANEL</button></div>
+    <div id="riderDashboard" style="display:none;"><div class="rider-logo">DELIVERY <span>DASHBOARD</span></div>
+    <div id="pendingOrdersSection"><div class="rider-field-label">📋 Pending Orders</div><div id="pendingOrdersList" style="margin-bottom:20px;">Loading...</div></div>
+    <div id="activeDeliverySection" style="display:none;"><div class="rider-field-label">🚚 Your Active Delivery</div><div id="activeDeliveryCard" class="active-delivery-card"></div>
+    <div><button class="navigate-btn" id="navigateBtn" onclick="navigateToAddress()"><i class="fas fa-directions"></i> Navigate</button>
+    <button id="riderShareBtn" class="rider-btn" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;" onclick="(riderSharing ? riderStopSharing : riderStartSharing)()">START SHARING</button>
+    <button id="markDeliveredBtn" class="rider-btn" style="background:#ef4444; display:inline-block; width:auto; padding:8px 16px;" onclick="markAsDelivered()">Delivered</button></div>
+    <div class="rider-status-block"><div class="rider-row"><span>Location Sharing</span><span id="riderShareStatus" class="rider-live-badge"><span class="rider-dot" id="riderDot"></span> Idle</span></div>
+    <div id="riderCoords" style="font-size:11px; color:#888;">Waiting for GPS</div></div></div>
+    <button class="rider-btn" style="background:#ef4444; margin-top:20px;" onclick="riderLogout()">LOGOUT</button></div></div></div>`;
 
-  // ==================== UI MENU, CART, ORDER ====================
+  // ==================== UI MENU, CART, ORDER (with location enforcement) ====================
   function goTo(p) {
     document.querySelectorAll('.page').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.ni').forEach(x => x.classList.remove('active'));
@@ -1073,7 +1062,6 @@
     if (p === 'track') setTrackMode('pickup');
     window.scrollTo({top:0, behavior:'smooth'});
   }
-
   function buildMenu() {
     const cats = actCat === "ALL" ? ["MAINS","PROTEINS","EXTRAS"] : [actCat];
     const CL = {MAINS:"🍝 Mains", PROTEINS:"🍗 Proteins", EXTRAS:"🥗 Extras"};
@@ -1099,12 +1087,10 @@
     }
     document.getElementById("menuContent").innerHTML = h;
   }
-
   document.querySelectorAll('.cat-pill').forEach(p => p.addEventListener('click', () => {
     document.querySelectorAll('.cat-pill').forEach(x => x.classList.remove('active'));
     p.classList.add('active'); actCat = p.dataset.cat; buildMenu();
   }));
-
   function addItem(id) { const it=ITEMS.find(i=>i.id===id); const ex=cart.find(i=>i.id===id); if(ex) ex.qty++; else cart.push({...it,qty:1}); updBadge(); toast("✅ "+it.name+" added to cart!"); }
   window.updateQty = (id,d) => { const idx=cart.findIndex(i=>i.id===id); if(idx===-1) return; cart[idx].qty+=d; if(cart[idx].qty<=0) cart.splice(idx,1); updBadge(); renderCart(); updPreview(); };
   function updBadge() { const n=cart.reduce((s,i)=>s+i.qty,0); document.getElementById("cartCount").textContent=n; const b=document.getElementById("navBadge"); b.style.display=n>0?"flex":"none"; b.textContent=n; }
@@ -1119,7 +1105,6 @@
     sm.style.display = "block";
     cw.innerHTML = `<button class="wa-btn" onclick="goTo('order')"><i class="fas fa-receipt"></i> FILL ORDER DETAILS</button>`;
   }
-
   function genMsg() {
     if (!cart.length) return "🔥 Patogrills: Cart is empty.";
     const lines = cart.map(i => `• ${i.qty} x ${i.name} — ${fmt(i.qty * i.price)}`).join("\n");
@@ -1130,23 +1115,33 @@
     const dl = OT === "Delivery" ? `\n🚚 Delivery fee: ${fmt(FEE)}` : "";
     return `🍢 *PATO GRILLS ORDER* 🍢\n\n🔖 *Order ID:* ${ORDER_ID}\n\n${lines}${dl}\n\n────────────────\n📦 *Total:* ${fmt(tot())}\n\n📌 *Order type:* ${OT}\n👤 *Name:* ${nm}\n📞 *Phone:* ${ph}${ad !== null ? `\n📍 *Address:* ${ad}` : ""}\n📝 *Notes:* ${nt}\n\n🔥 *Enjoy the Thrills Of The Grills — Good Food No Dey Rush*`;
   }
-
   function updPreview() {
     document.getElementById("preview").textContent = genMsg();
     const lk = document.getElementById("sendLink");
     if (!cart.length) { lk.href = "#"; return; }
     lk.href = `https://wa.me/${PH}?text=${encodeURIComponent(genMsg())}`;
   }
-
   document.getElementById("sendLink").addEventListener("click", async (e) => {
     if (!cart.length) { e.preventDefault(); toast("🍽️ Add items first!"); return; }
     if (OT === "Delivery" && !document.getElementById("address").value.trim()) { e.preventDefault(); toast("📍 Please enter your delivery address first"); return; }
-    const saved = await saveOrderToRTDB();
-    if (!saved) e.preventDefault();
+    if (OT === "Delivery") {
+      try {
+        const coords = await captureCustomerLocation();
+        const saved = await saveOrderToRTDB(coords);
+        if (!saved) { e.preventDefault(); return; }
+        // order saved, proceed with WhatsApp link
+      } catch (err) {
+        e.preventDefault();
+        toast(err.message || "Location permission required. Please enable GPS to place delivery order.");
+        return;
+      }
+    } else {
+      // Pickup: no location needed
+      const saved = await saveOrderToRTDB(null);
+      if (!saved) e.preventDefault();
+    }
   });
-
   ["name","phone","address","notes"].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener("input", updPreview); });
-
   const pickupPanel = document.getElementById("pickupPanel"), deliveryPanel = document.getElementById("deliveryPanel");
   const togglePickup = document.getElementById("togglePickupBtn"), toggleDelivery = document.getElementById("toggleDeliveryTrackBtn");
   function setTrackMode(mode) {
@@ -1156,7 +1151,7 @@
   togglePickup.addEventListener("click", () => setTrackMode('pickup'));
   toggleDelivery.addEventListener("click", () => setTrackMode('delivery'));
 
-  // ==================== ONBOARDING CONTROL ====================
+  // ==================== ONBOARDING ====================
   let obI = 0;
   function showOBStep(i) {
     for(let j=0;j<4;j++){ document.getElementById("os"+j).classList.toggle("on",j===i); document.getElementById("d"+j).classList.toggle("on",j===i); }
@@ -1167,25 +1162,13 @@
   function closeOB() { localStorage.setItem("pg_ob2","1"); const el=document.getElementById("onboarding"); el.classList.add("fade-out"); setTimeout(()=>el.classList.add("gone"),380); }
   function initOB() { if(localStorage.getItem("pg_ob2")){ document.getElementById("onboarding").classList.add("gone"); return; } showOBStep(0); }
 
-  // ==================== RIDER MODAL INIT ====================
-  document.getElementById("riderModal").innerHTML = `
-    <div class="rider-modal-content"><div class="rider-close" onclick="closeRiderModal()">&times;</div>
-    <div class="rider-inner"><div id="riderLoginPanel"><div class="rider-logo">PATO<span>GRILLS</span></div>
-    <div class="rider-field-label">Rider PIN</div><input type="password" id="riderPin" class="rider-input" placeholder="••••••">
-    <div id="riderError" class="rider-error">Invalid PIN (use pato2026)</div>
-    <button class="rider-btn" onclick="riderLogin()">ENTER PANEL</button></div>
-    <div id="riderDashboard" style="display:none;"><div class="rider-logo">DELIVERY <span>DASHBOARD</span></div>
-    <div id="pendingOrdersSection"><div class="rider-field-label">📋 Pending Orders</div><div id="pendingOrdersList" style="margin-bottom:20px;">Loading...</div></div>
-    <div id="activeDeliverySection" style="display:none;"><div class="rider-field-label">🚚 Your Active Delivery</div><div id="activeDeliveryCard" class="active-delivery-card"></div>
-    <div><button class="navigate-btn" id="navigateBtn" onclick="navigateToAddress()"><i class="fas fa-directions"></i> Navigate</button>
-    <button id="riderShareBtn" class="rider-btn" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;" onclick="riderToggleSharing()">START SHARING</button>
-    <button id="markDeliveredBtn" class="rider-btn" style="background:#ef4444; display:inline-block; width:auto; padding:8px 16px;" onclick="markAsDelivered()">Delivered</button></div>
-    <div class="rider-status-block"><div class="rider-row"><span>Location Sharing</span><span id="riderShareStatus" class="rider-live-badge"><span class="rider-dot" id="riderDot"></span> Idle</span></div>
-    <div id="riderCoords" style="font-size:11px; color:#888;">Waiting for GPS</div></div></div>
-    <button class="rider-btn" style="background:#ef4444; margin-top:20px;" onclick="riderLogout()">LOGOUT</button></div></div></div>`;
-
-  // ==================== INITIALIZE EVERYTHING ====================
+  // ==================== INIT ====================
   buildMenu(); renderCart(); initOB(); selOT("Delivery"); updateOrderBannerVisibility(); setTrackMode('pickup');
+  // Fix rider share button reference after modal injection
+  setTimeout(() => {
+    const btn = document.getElementById("riderShareBtn");
+    if (btn) btn.onclick = () => { if (riderSharing) riderStopSharing(); else riderStartSharing(); };
+  }, 100);
 </script>
 </body>
 </html>
