@@ -17,7 +17,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
   <style>
-    /* ===== YOUR EXACT STYLES (unchanged – preserved completely) ===== */
+    /* ===== YOUR EXACT STYLES (unchanged) ===== */
     :root {
       --fire: #f2622e;
       --fire-deep: #c84318;
@@ -476,7 +476,7 @@
 </head>
 <body>
 
-<!-- ONBOARDING (unchanged) -->
+<!-- ONBOARDING -->
 <div id="onboarding">
   <div class="ob-sheet">
     <div class="ob-dots"><div class="ob-dot on" id="d0"></div><div class="ob-dot" id="d1"></div><div class="ob-dot" id="d2"></div><div class="ob-dot" id="d3"></div></div>
@@ -535,7 +535,7 @@
   <div style="margin-top:14px;" id="chkWrap"></div>
 </div>
 
-<!-- PAGE: ORDER (with automatic geolocation capture + location permission enforcement) -->
+<!-- PAGE: ORDER -->
 <div id="page-order" class="page">
   <div class="sec-title"><i class="fas fa-receipt"></i> Your Details</div>
   <div id="orderIdBanner" class="order-id-banner">
@@ -564,7 +564,7 @@
   </div>
 </div>
 
-<!-- PAGE: TRACK ORDER (Leaflet + OSRM) -->
+<!-- PAGE: TRACK ORDER -->
 <div id="page-track" class="page">
   <div class="sec-title"><i class="fas fa-map-marked-alt"></i> Track Order</div>
   <div class="track-toggle-bar">
@@ -626,6 +626,11 @@
   };
   firebase.initializeApp(firebaseConfig);
   const rtdb = firebase.database();
+
+  // ==================== CONNECTION TEST (REMOVE AFTER DEBUG) ====================
+  rtdb.ref('test/connection').set({ timestamp: Date.now(), status: 'Patogrills connected' })
+    .then(() => console.log('✅ Firebase write successful! Database is writable.'))
+    .catch(err => console.error('❌ Firebase write FAILED:', err, '– Check your Realtime Database rules (they must allow write: true for testing)'));
 
   // ==================== GLOBAL VARIABLES ====================
   const ITEMS = [
@@ -719,15 +724,26 @@
     });
   }
 
-  // ==================== SAVE ORDER TO REALTIME DB ====================
+  // ==================== SAVE ORDER TO REALTIME DB (FIXED) ====================
   async function saveOrderToRTDB(customerCoords) {
-    if (!cart.length) return false;
+    console.log("🔵 saveOrderToRTDB called with coords:", customerCoords);
+    if (!cart.length) {
+      console.log("❌ Cart empty, aborting save");
+      toast("❌ Your cart is empty. Add items first.");
+      return false;
+    }
     const name = document.getElementById("name").value.trim();
     const phone = document.getElementById("phone").value.trim();
     const address = OT === "Delivery" ? document.getElementById("address").value.trim() : "";
     const notes = document.getElementById("notes").value.trim();
-    if (!name || !phone) { toast("❌ Please fill in your name and phone number"); return false; }
-    if (OT === "Delivery" && !address) { toast("📍 Please enter your delivery address"); return false; }
+    if (!name || !phone) {
+      toast("❌ Please fill in your name and phone number");
+      return false;
+    }
+    if (OT === "Delivery" && !address) {
+      toast("📍 Please enter your delivery address");
+      return false;
+    }
 
     const orderData = {
       orderId: ORDER_ID,
@@ -745,11 +761,17 @@
       customerLocation: customerCoords ? { latitude: customerCoords.lat, longitude: customerCoords.lng, timestamp: Date.now() } : null
     };
 
+    console.log("📦 Attempting to save order:", orderData);
     try {
       await rtdb.ref('orders/' + ORDER_ID).set(orderData);
+      console.log("✅ Order saved successfully in Firebase at orders/" + ORDER_ID);
       toast("✅ Order saved! Track via the Track tab.");
       return true;
-    } catch (err) { console.error(err); toast("⚠️ Could not save order"); return false; }
+    } catch (err) {
+      console.error("❌ Firebase save error:", err);
+      toast("⚠️ Could not save order. Check console for details.");
+      return false;
+    }
   }
 
   // ==================== ORDER TYPE SELECT ====================
@@ -940,20 +962,14 @@
     setTimeout(() => { if (!riderSharing && riderCurrentOrderId) riderStartSharing(); }, 500);
   };
 
-  // NEW: Cancel delivery function
   window.cancelDelivery = async function() {
     if (!riderCurrentOrderId) return;
     if (!confirm("⚠️ Cancel this delivery? The order will be put back for other riders to accept.")) return;
-    
-    // Stop GPS sharing if active
     if (riderSharing) riderStopSharing();
-    
     const orderRef = rtdb.ref('orders/' + riderCurrentOrderId);
     const snap = await orderRef.once('value');
     const order = snap.val();
     if (!order) return;
-    
-    // Reset order back to pending/unassigned state
     await orderRef.update({
       assigned: false,
       status: "pending",
@@ -962,11 +978,10 @@
       lastStatusUpdate: null,
       assignedAt: null
     });
-    
     toast(`❌ Delivery cancelled for order ${order.orderId}`);
     riderCurrentOrderId = null;
     document.getElementById("activeDeliverySection").style.display = "none";
-    await loadPendingOrders(); // Refresh pending list
+    await loadPendingOrders();
   };
 
   async function resumeActiveDelivery() {
@@ -1101,7 +1116,7 @@
   window.closeRiderModal = function() { document.getElementById("riderModal").classList.remove("active"); if(riderSharing) riderStopSharing(); };
   window.openRiderModal = function() { document.getElementById("riderModal").classList.add("active"); };
 
-  // Rider modal HTML with Cancel Delivery button (alongside Delivered)
+  // Rider modal HTML with Cancel Delivery button
   document.getElementById("riderModal").innerHTML = `
     <div class="rider-modal-content"><div class="rider-close" onclick="closeRiderModal()">&times;</div>
     <div class="rider-inner"><div id="riderLoginPanel"><div class="rider-logo">PATO<span>GRILLS</span></div>
@@ -1199,6 +1214,7 @@
   }
 
   document.getElementById("sendLink").addEventListener("click", async (e) => {
+    console.log("Send button clicked");
     if (!cart.length) { e.preventDefault(); toast("🍽️ Add items first!"); return; }
     if (OT === "Delivery" && !document.getElementById("address").value.trim()) { e.preventDefault(); toast("📍 Please enter your delivery address first"); return; }
     if (OT === "Delivery") {
