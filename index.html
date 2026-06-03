@@ -405,6 +405,12 @@
       color: white;
       margin-bottom: 12px;
     }
+    .rider-btn-cancel {
+      background: #6b21a5;
+    }
+    .rider-btn-delivered {
+      background: #22c55e;
+    }
     .rider-error {
       color: #ef4444;
       font-size: 13px;
@@ -461,6 +467,7 @@
     .rider-trigger:hover { opacity: 0.8; }
     .active-delivery-card { background:#1a1a1a; border-radius:16px; padding:16px; margin-bottom:16px; border-left:4px solid #22c55e; }
     .navigate-btn { background:#1a73e8; color:white; border:none; border-radius:8px; padding:8px 16px; cursor:pointer; margin-right:8px; }
+    .action-buttons-group { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
     #liveTrackingMap { height: 280px; border-radius: 20px; margin-top: 12px; background: #e9e5e0; z-index: 1; width: 100%; }
     .track-info-panel { background: rgba(0,0,0,0.7); border-radius: 16px; padding: 12px; margin-top: 12px; color: white; font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
     .track-info-panel span { display: flex; align-items: center; gap: 6px; }
@@ -557,7 +564,7 @@
   </div>
 </div>
 
-<!-- PAGE: TRACK ORDER (Leaflet + OSRM - FIXED: shows both markers, route, distance, ETA) -->
+<!-- PAGE: TRACK ORDER (Leaflet + OSRM) -->
 <div id="page-track" class="page">
   <div class="sec-title"><i class="fas fa-map-marked-alt"></i> Track Order</div>
   <div class="track-toggle-bar">
@@ -607,7 +614,7 @@
 <div id="riderModal" class="rider-modal"></div>
 
 <script>
-  // ==================== FIREBASE CONFIG (ORIGINAL) ====================
+  // ==================== FIREBASE CONFIG ====================
   const firebaseConfig = {
     apiKey: "AIzaSyDNZUtiUoEuV6cqF90144wqwsGAFERnsuw",
     authDomain: "tracking-61ea4.firebaseapp.com",
@@ -680,7 +687,6 @@
     }
   }
 
-  // Run cleanup every 60 minutes (only if rider is likely active, but harmless otherwise)
   setInterval(() => {
     if (document.getElementById("riderDashboard")?.style.display === "block") {
       deleteOldOrders();
@@ -713,7 +719,7 @@
     });
   }
 
-  // ==================== SAVE ORDER TO REALTIME DB (stores customerLocation) ====================
+  // ==================== SAVE ORDER TO REALTIME DB ====================
   async function saveOrderToRTDB(customerCoords) {
     if (!cart.length) return false;
     const name = document.getElementById("name").value.trim();
@@ -756,7 +762,7 @@
     document.getElementById("locationStatus").innerHTML = "";
   };
 
-  // ==================== TRACKING MAP (CUSTOMER + RIDER + ROUTE) ====================
+  // ==================== TRACKING MAP ====================
   function initTrackMap(custLat, custLng) {
     const container = document.getElementById("liveTrackingMap");
     container.style.display = "block";
@@ -881,10 +887,9 @@
     trackDeliveryOrder(inputId);
   });
 
-  // ==================== OPTIMIZED RIDER WORKFLOW ====================
+  // ==================== RIDER WORKFLOW WITH CANCEL BUTTON ====================
   const RIDER_PIN = "pato2026";
   
-  // Load only pending delivery orders that are not assigned, limit to latest 20
   async function loadPendingOrders() {
     if (pendingOrdersListener) pendingOrdersListener();
     const container = document.getElementById("pendingOrdersList");
@@ -915,7 +920,7 @@
     document.getElementById("riderDashboard").style.display = "block";
     await loadPendingOrders();
     await resumeActiveDelivery();
-    deleteOldOrders(); // run cleanup on login
+    deleteOldOrders();
   }
 
   window.acceptOrder = async function(orderId) {
@@ -933,6 +938,35 @@
     await showActiveDelivery();
     loadPendingOrders();
     setTimeout(() => { if (!riderSharing && riderCurrentOrderId) riderStartSharing(); }, 500);
+  };
+
+  // NEW: Cancel delivery function
+  window.cancelDelivery = async function() {
+    if (!riderCurrentOrderId) return;
+    if (!confirm("⚠️ Cancel this delivery? The order will be put back for other riders to accept.")) return;
+    
+    // Stop GPS sharing if active
+    if (riderSharing) riderStopSharing();
+    
+    const orderRef = rtdb.ref('orders/' + riderCurrentOrderId);
+    const snap = await orderRef.once('value');
+    const order = snap.val();
+    if (!order) return;
+    
+    // Reset order back to pending/unassigned state
+    await orderRef.update({
+      assigned: false,
+      status: "pending",
+      riderLocation: null,
+      riderStatus: null,
+      lastStatusUpdate: null,
+      assignedAt: null
+    });
+    
+    toast(`❌ Delivery cancelled for order ${order.orderId}`);
+    riderCurrentOrderId = null;
+    document.getElementById("activeDeliverySection").style.display = "none";
+    await loadPendingOrders(); // Refresh pending list
   };
 
   async function resumeActiveDelivery() {
@@ -1067,7 +1101,7 @@
   window.closeRiderModal = function() { document.getElementById("riderModal").classList.remove("active"); if(riderSharing) riderStopSharing(); };
   window.openRiderModal = function() { document.getElementById("riderModal").classList.add("active"); };
 
-  // Rider modal HTML with cleanup button
+  // Rider modal HTML with Cancel Delivery button (alongside Delivered)
   document.getElementById("riderModal").innerHTML = `
     <div class="rider-modal-content"><div class="rider-close" onclick="closeRiderModal()">&times;</div>
     <div class="rider-inner"><div id="riderLoginPanel"><div class="rider-logo">PATO<span>GRILLS</span></div>
@@ -1078,8 +1112,11 @@
     <div id="pendingOrdersSection"><div class="rider-field-label">📋 Pending Orders</div><div id="pendingOrdersList" style="margin-bottom:20px;">Loading...</div></div>
     <div id="activeDeliverySection" style="display:none;"><div class="rider-field-label">🚚 Your Active Delivery</div><div id="activeDeliveryCard" class="active-delivery-card"></div>
     <div><button class="navigate-btn" onclick="navigateToAddress()"><i class="fas fa-directions"></i> Navigate</button>
-    <button id="riderShareBtn" class="rider-btn" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;">START SHARING</button>
-    <button id="markDeliveredBtn" class="rider-btn" style="background:#ef4444; display:inline-block; width:auto; padding:8px 16px;" onclick="markAsDelivered()">Delivered</button></div>
+    <button id="riderShareBtn" class="rider-btn" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;">START SHARING</button></div>
+    <div class="action-buttons-group">
+      <button id="cancelDeliveryBtn" class="rider-btn rider-btn-cancel" style="background:#6b21a5; display:inline-block; width:auto; padding:8px 16px;" onclick="cancelDelivery()">Cancel Delivery</button>
+      <button id="markDeliveredBtn" class="rider-btn rider-btn-delivered" style="background:#22c55e; display:inline-block; width:auto; padding:8px 16px;" onclick="markAsDelivered()">Delivered</button>
+    </div>
     <div class="rider-status-block"><div class="rider-row"><span>Location Sharing</span><span id="riderShareStatus" class="rider-live-badge"><span class="rider-dot"></span> Idle</span></div>
     <div id="riderCoords" style="font-size:11px; color:#888;">Waiting for GPS</div></div></div>
     <button class="rider-btn" style="background:#3b82f6; margin-top:10px;" onclick="deleteOldOrders()"><i class="fas fa-trash-alt"></i> Clean Old Orders (24h+)</button>
